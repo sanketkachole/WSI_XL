@@ -70,7 +70,7 @@ except Exception:
     wandb = None  # type: ignore
 
 
-# -----------------------------
+# ------------------------------
 # Logging
 # -----------------------------
 def setup_logging(log_level: str) -> None:
