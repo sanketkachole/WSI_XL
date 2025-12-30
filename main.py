@@ -41,8 +41,8 @@ Notes:
 
 """
 
-from __future__ import annotations
 
+from __future__ import annotations
 import argparse
 import csv
 import dataclasses
@@ -548,7 +548,9 @@ class SlideXL(nn.Module):
         mem_v: List[Optional[torch.Tensor]],
         keep_last: int,
     ) -> Tuple[List[Optional[torch.Tensor]], List[Optional[torch.Tensor]]]:
-        """Keep only the most recent keep_last SSTs in memory for each layer."""
+        """Keep only the most recent keep_last SSTs in memory for each layer.
+            keep the KV “memory” from getting too long.
+            It keeps only the most recent keep_last SST entries per transformer layer."""
         if keep_last <= 0:
             return [None] * len(mem_k), [None] * len(mem_v)
 
@@ -581,7 +583,7 @@ class SlideXL(nn.Module):
         B, L, D = patch_tokens.shape
         r = self.sst_every_r
         # number of SSTs: ceil(L / r) but we add after each full segment; if last shorter, still add one
-        K = (L + r - 1) // r
+        K = (L + r - 1) // r  # Compute how many SST tokens to add
         out_len = L + K
 
         tokens = patch_tokens.new_empty((B, out_len, D))
@@ -619,7 +621,7 @@ class SlideXL(nn.Module):
           mem_tokens_per_layer: list of (1, M, D) reconstructed token representations for memory (for cross-attn)
           mem_mask: (1, M) bool
         """
-        # Order patches
+        # Order patches : If you have (x,y) coords for patches, it sorts them into a spatial scan order (so the stream is consistent).
         if coords is not None:
             order = spatial_order_indices(coords.to(device))
             patch_embeds = patch_embeds.to(device)[order]
@@ -630,9 +632,10 @@ class SlideXL(nn.Module):
         patch_tokens_all = self.projector(patch_embeds.unsqueeze(0))  # (1, N, D)
         _, N, _ = patch_tokens_all.shape
 
+        # Split into chunks : Instead of processing all N patches at once (too big), it processes ranges (s,e).
         chunks = make_chunks(n_tokens=N, chunk_size=chunk_size)
 
-        # per-layer cached KV for SSTs
+        # per-layer cached KV for SSTs : These hold the cached attention keys/values from SST tokens across chunks.
         mem_k: List[Optional[torch.Tensor]] = [None for _ in range(self.n_layers)]
         mem_v: List[Optional[torch.Tensor]] = [None for _ in range(self.n_layers)]
 
@@ -641,21 +644,25 @@ class SlideXL(nn.Module):
         mem_tokens: List[torch.Tensor] = []
 
         for (s, e) in chunks:
+            # take chunk patches and insert SST tokens This produces a sequence like: P P P P SST P P P P SST
+            # sst_mask marks where SST tokens are.
             cur_patch_tokens = patch_tokens_all[:, s:e, :]  # (1, Lc, D)
-            tokens, sst_mask = self._interleave_sst(cur_patch_tokens)  # (1, Lc+Kc, D)
+            tokens, sst_mask = self._interleave_sst(cur_patch_tokens)  # (1, Lc+Kc, D) ******** patch token into SST ****************
 
             x = tokens
             # No attention mask: we allow full attention over (memory + current chunk tokens).
             for li, layer in enumerate(self.layers):
+                # run transformer layers with past SST memory. Key idea: current tokens attend to (past SST memory + current tokens).
                 x, k, v = layer(x, mem_k=mem_k[li], mem_v=mem_v[li], attn_mask=None)
 
-                # Keep only SST K/V from current chunk
+                # Keep only SST K/V from current chunk  ************** IMP step *****************
                 # k,v: (B=1, H, Lcur, Dh) where Lcur = tokens_len
                 # sst_mask: (B=1, Lcur)
                 sst_idx = torch.nonzero(sst_mask[0], as_tuple=False).squeeze(-1)  # (Kc,)
                 k_sst = k[:, :, sst_idx, :].contiguous()
                 v_sst = v[:, :, sst_idx, :].contiguous()
 
+                # append the above SST KV from the current chunk to layer memory: ************** IMP step *****************
                 if mem_k[li] is None:
                     mem_k[li], mem_v[li] = k_sst, v_sst
                 else:
@@ -696,6 +703,11 @@ class SlideXL(nn.Module):
         mem_list: List[torch.Tensor] = []
         mem_mask_list: List[torch.Tensor] = []
 
+
+        # Each sample has its own slide (different #patches), so it loops over batch.
+        # encode_slide_memory streams the slide in chunks and returns SST memory tokens (shape (1, M, D)).
+        # mem_mask marks which memory positions are valid.
+        # Result: mem_list[i] is a variable-length memory sequence for slide i.
         for i in range(B):
             mem_tokens_per_layer, mem_mask = self.encode_slide_memory(
                 patch_embeds=batch_patch_embeds[i],
@@ -707,7 +719,7 @@ class SlideXL(nn.Module):
             mem_list.append(mem_tokens_per_layer[0])  # (1, M, D)
             mem_mask_list.append(mem_mask)            # (1, M)
 
-        # Pad memory across batch
+        # Pad memory across batch. Because each slide produces a different patch M, it pads them to M_max so cross-attention can run in a batch.
         M_max = max(m.shape[1] for m in mem_list)
         mem = torch.zeros((B, M_max, self.d_model), device=device, dtype=mem_list[0].dtype)
         mem_mask = torch.zeros((B, M_max), device=device, dtype=torch.bool)
@@ -717,11 +729,13 @@ class SlideXL(nn.Module):
             mem[i, : m.shape[0], :] = m
             mem_mask[i, : mm.shape[0]] = mm
 
-        # Report embeddings
+        # Report embeddings. Converts report token IDs into vectors. # Zeroes out padding tokens (mask is boolean).
         rep = self.text_emb(report_input_ids)  # (B,T,D)
         rep = rep * report_attn_mask.unsqueeze(-1).to(rep.dtype)
 
         # Late fusion cross-attention: report queries -> slide memory
+        # Queries = report tokens & Keys/Values = slide memory tokens (SSTs)
+        # So each report token can “look up” relevant slide info from the compressed memory.
         rep_h = self.report_norm1(rep)
         mem_mask_4d = mem_mask[:, None, None, :]  # (B,1,1,M)
         ca = self.cross_attn(q_in=rep_h, mem=mem, mem_mask=mem_mask_4d)
@@ -765,13 +779,19 @@ class SlideXL(nn.Module):
 # -----------------------------
 @torch.no_grad()
 def accuracy_from_logits(logits: torch.Tensor, targets: torch.Tensor, task_type: str) -> float:
+    # Picks the class with highest score
+    # Accuracy = fraction of samples where predicted class == target
     if task_type == "multiclass":
         pred = torch.argmax(logits, dim=1)
         return (pred == targets.long()).float().mean().item()
+    # Converts logits to probabilities # Thresholds at 0.5
+    # Flattens to (B,) # Compares with {0,1} targets
     if task_type == "binary":
         pred = (torch.sigmoid(logits) > 0.5).view(-1)
         tgt = targets.view(-1) > 0.5
         return (pred == tgt).float().mean().item()
+    # Same thresholding But applied per label
+    # Accuracy = fraction of correctly predicted label entries (not per sample)
     if task_type == "multilabel":
         pred = (torch.sigmoid(logits) > 0.5)
         tgt = targets > 0.5
@@ -1046,7 +1066,10 @@ def evaluate(cfg: TrainConfig, model: SlideXL, loader: DataLoader, device: torch
 
 def train(cfg: TrainConfig) -> None:
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
-    (cfg.out_dir / "config.json").write_text(json.dumps(dataclasses.asdict(cfg), indent=2))
+    cfg_dict = dataclasses.asdict(cfg)
+    cfg_dict = {k: str(v) if isinstance(v, Path) else v for k, v in cfg_dict.items()}
+    (cfg.out_dir / "config.json").write_text(json.dumps(cfg_dict, indent=2))
+
 
     seed_everything(cfg.seed)
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
