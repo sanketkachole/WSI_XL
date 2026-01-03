@@ -1,0 +1,6 @@
+{
+  "breast_project_id": "TCGA-BRCA",
+  "n_patients": 991,
+  "text_rows_min": 31,
+  "text_rows_max": 9518
+}
