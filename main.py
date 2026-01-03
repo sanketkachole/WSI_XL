@@ -4,42 +4,47 @@ Slide-XL: KV-summarized long-context WSI + report modeling (late fusion)
 
 Assumptions (adjust via CLI flags):
 - You already extracted and saved:
-  1) WSI patch embeddings per case:  (N_patches, d_v) float32
+  1) WSI patch embeddings per case, stored in an H5 file (path provided in CSV):
+       (N_patches, d_v) float32
+     The script searches the H5 for a 2D dataset with shape (N, d_v) and loads that. If not found, it falls back to a single non-coordinate 2D dataset (d>2).
   2) (Optional) patch coordinates per case: (N_patches, 2) int/float
-  3) Text report token ids per case: (T,) int64 and attention mask: (T,) int64/bool
+     NOTE: current code sets coords=None (no spatial ordering) unless you wire coords in.
+  3) Text report *token-level embeddings* per report (NOT token ids):
+       text_token_embeds_npy: (num_reports, T, d_t) or object array with per-row (T_i, d_t)
+       text_attention_mask_npy: (num_reports, T) or object array with per-row (T_i,)
+     The row index into these arrays is provided by `text_row` in the split CSV.
+
 - This script trains/evaluates a model that:
   - Streams patch embeddings in chunks
   - Inserts learnable Slide Summarization Tokens (SST) every r patches
   - Runs a transformer over each chunk while attending to cached SST K/V from previous chunks
   - Keeps only SST K/V across chunks; discards raw patch token K/V
-  - Performs late fusion: report tokens query the final slide memory via cross-attention
-  - Produces slide-level predictions (classification)
+  - Performs late fusion: report token embeddings query the final slide memory via cross-attention
+  - Produces slide-level predictions (binary or multilabel classification as implemented)
 
 Data layout (recommended):
   data_root/
-    cases/
-      <case_id>/
-        patch_embeds.npy          # (N, d_v)
-        coords.npy                # (N, 2) OPTIONAL
-        report_input_ids.npy      # (T,)
-        report_attention_mask.npy # (T,)
     splits/
       train.csv
       val.csv
       test.csv
+  text_token_embeds_npy (passed via --text_token_embeds_npy)
+  text_attention_mask_npy (passed via --text_attention_mask_npy)
 
 Each split CSV must contain at least:
-  case_id,label
-For multi-label, add multiple columns and use --label_cols.
+  case_id,h5_path,text_row,<label cols...>
+
+Example:
+  case_id,h5_path,text_row,label
 
 Notes:
-- This is an end-to-end training script, but you must adapt:
-  - number of classes / label columns
-  - loss type (binary vs multiclass)
-  - evaluation metrics
-  - exact feature filenames if different
-
+- This script currently supports:
+  - --task_type binary (exactly one label col)
+  - --task_type multilabel (one column per label)
+  - multiclass is not enabled in parse_args() (will raise).
+- You must ensure `text_row` correctly indexes into the provided text .npy arrays.
 """
+
 
 
 from __future__ import annotations
@@ -63,6 +68,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
+import h5py
+from functools import partial
 
 try:
     import wandb
@@ -112,25 +119,80 @@ def load_npy(path: Path) -> np.ndarray:
     return arr
 
 
+def collate_with_text(
+    recs: Sequence[CaseRecord],
+    *,
+    max_report_len: int,
+    text_token_embeds: np.ndarray,
+    text_attention_mask: np.ndarray,
+    d_v: int,
+) -> Batch:
+    return collate_fn(
+        recs,
+        max_report_len=max_report_len,
+        text_token_embeds=text_token_embeds,
+        text_attention_mask=text_attention_mask,
+        d_v=d_v,
+    )
+
+
+
+
+
+def load_patch_embeds_from_h5(h5_path: str, d_v: int) -> np.ndarray:
+    if not os.path.exists(h5_path):
+        raise FileNotFoundError(h5_path)
+
+    candidates = []
+
+    with h5py.File(h5_path, "r") as f:
+        def _visit(name, obj):
+            if isinstance(obj, h5py.Dataset):
+                shape = obj.shape
+                if shape is None or len(shape) != 2:
+                    return
+                n, d = int(shape[0]), int(shape[1])
+                candidates.append((name, n, d))
+
+        f.visititems(_visit)
+
+        # prefer exact embedding dim match
+        for name, n, d in sorted(candidates, key=lambda x: -x[1]):  # largest N first
+            if d == d_v:
+                return np.asarray(f[name][()])
+
+        # fallback: if only one plausible (d>2) dataset exists
+        non_coord = [(name, n, d) for name, n, d in candidates if d > 2]
+        if len(non_coord) == 1:
+            name, _, _ = non_coord[0]
+            return np.asarray(f[name][()])
+
+    raise ValueError(
+        f"Could not find patch embeddings with d_v={d_v} in {h5_path}. "
+        f"Found datasets: {candidates}"
+    )
+
+
 # -----------------------------
 # Data
 # -----------------------------
 @dataclass(frozen=True)
 class CaseRecord:
     case_id: str
-    y: np.ndarray  # shape: (num_labels,)
+    h5_path: str
+    text_row: int
+    y: np.ndarray  # (L,)
+
 
 
 class WSIFeatureDataset(Dataset[CaseRecord]):
     def __init__(
         self,
         csv_path: Path,
-        cases_dir: Path,
         label_cols: List[str],
         strict_files: bool = True,
     ) -> None:
         self.csv_path = csv_path
-        self.cases_dir = cases_dir
         self.label_cols = label_cols
         self.strict_files = strict_files
         self.records: List[CaseRecord] = self._read_csv()
@@ -139,30 +201,30 @@ class WSIFeatureDataset(Dataset[CaseRecord]):
         records: List[CaseRecord] = []
         with self.csv_path.open("r", newline="") as f:
             reader = csv.DictReader(f)
-            missing = [c for c in (["case_id"] + self.label_cols) if c not in reader.fieldnames]
+            required = ["case_id", "h5_path", "text_row"] + self.label_cols
+            missing = [c for c in required if c not in (reader.fieldnames or [])]
             if missing:
                 raise ValueError(f"CSV {self.csv_path} missing columns: {missing}")
 
             for row in reader:
-                cid = row["case_id"]
+                cid = str(row["case_id"])
+                h5_path = str(row["h5_path"])
+                text_row = int(float(row["text_row"]))  # robust if saved as "12.0"
+
                 y_vals: List[float] = []
                 for c in self.label_cols:
                     if row[c] == "" or row[c] is None:
                         raise ValueError(f"Missing label in {self.csv_path} for case_id={cid}, col={c}")
                     y_vals.append(float(row[c]))
                 y = np.asarray(y_vals, dtype=np.float32)
+
                 if self.strict_files:
-                    case_path = self.cases_dir / cid
-                    required = [
-                        case_path / "patch_embeds.npy",
-                        case_path / "report_input_ids.npy",
-                        case_path / "report_attention_mask.npy",
-                    ]
-                    for p in required:
-                        if not p.exists():
-                            raise FileNotFoundError(f"Missing required file: {p}")
-                records.append(CaseRecord(case_id=cid, y=y))
+                    if not os.path.exists(h5_path):
+                        raise FileNotFoundError(f"Missing WSI h5 file: {h5_path}")
+                records.append(CaseRecord(case_id=cid, h5_path=h5_path, text_row=text_row, y=y))
+
         return records
+
 
     def __len__(self) -> int:
         return len(self.records)
@@ -174,80 +236,103 @@ class WSIFeatureDataset(Dataset[CaseRecord]):
 @dataclass
 class Batch:
     case_ids: List[str]
-    patch_embeds: List[torch.Tensor]  # list of (N, d_v)
-    coords: List[Optional[torch.Tensor]]  # list of (N, 2) or None
-    report_input_ids: torch.Tensor  # (B, T)
-    report_attn_mask: torch.Tensor  # (B, T) bool
-    labels: torch.Tensor  # (B, L)
+    patch_embeds: List[torch.Tensor]              # list of (N, d_v)
+    coords: List[Optional[torch.Tensor]]          # list of (N, 2) or None
+    report_token_embeds: torch.Tensor             # (B, T, Dt)
+    report_attn_mask: torch.Tensor                # (B, T) bool
+    labels: torch.Tensor                          # (B, L)
 
 
-def collate_fn(records: Sequence[CaseRecord], cases_dir: Path, max_report_len: int) -> Batch:
+def _get_text_row(arr: np.ndarray, i: int) -> np.ndarray:
+    x = arr[i]
+    # handle object arrays
+    if isinstance(x, np.ndarray):
+        return x
+    return np.asarray(x)
+
+
+def collate_fn(
+    records: Sequence[CaseRecord],
+    max_report_len: int,
+    text_token_embeds: np.ndarray,
+    text_attention_mask: np.ndarray,
+    d_v: int,
+) -> Batch:
     case_ids: List[str] = []
     patch_embeds: List[torch.Tensor] = []
     coords_list: List[Optional[torch.Tensor]] = []
-    report_ids_list: List[torch.Tensor] = []
-    report_mask_list: List[torch.Tensor] = []
+    tok_list: List[torch.Tensor] = []
+    msk_list: List[torch.Tensor] = []
     labels_list: List[torch.Tensor] = []
 
+    Dt: Optional[int] = None
+
     for rec in records:
-        cid = rec.case_id
-        case_path = cases_dir / cid
+        case_ids.append(rec.case_id)
 
-        pe = torch.from_numpy(load_npy(case_path / "patch_embeds.npy")).float()  # (N, d_v)
-        if pe.ndim != 2:
-            raise ValueError(f"patch_embeds must be 2D (N,d_v). Got {pe.shape} for {cid}")
+        # --- WSI ---
+        with h5py.File(rec.h5_path, "r") as f:
+            pe_np = np.asarray(f["features"], dtype=np.float32)   # (N, d_v)
+            coords_np = np.asarray(f["coords"], dtype=np.int64) # (N, 2)
 
-        coords_path = case_path / "coords.npy"
-        if coords_path.exists():
-            co = torch.from_numpy(load_npy(coords_path)).float()
-            if co.ndim != 2 or co.shape[1] != 2:
-                raise ValueError(f"coords must be (N,2). Got {co.shape} for {cid}")
-        else:
-            co = None
+        if pe_np.ndim != 2 or pe_np.shape[1] != d_v:
+            raise ValueError(
+                f"patch_embeds must be (N,{d_v}); got {pe_np.shape} for {rec.case_id}"
+            )
+        if coords_np.ndim != 2 or coords_np.shape[1] != 2:
+            raise ValueError(
+                f"coords must be (N,2); got {coords_np.shape} for {rec.case_id}"
+            )
 
-        ids = torch.from_numpy(load_npy(case_path / "report_input_ids.npy")).long()
-        msk = load_npy(case_path / "report_attention_mask.npy")
-        msk = safe_cast_bool_mask(msk)
-        msk_t = torch.from_numpy(msk).bool()
+        patch_embeds.append(torch.from_numpy(pe_np))
+        coords_list.append(torch.from_numpy(coords_np))
 
-        # truncate/pad report
-        if ids.ndim != 1 or msk_t.ndim != 1:
-            raise ValueError(f"report arrays must be 1D. Got ids={ids.shape} mask={msk_t.shape} for {cid}")
 
-        T = min(ids.shape[0], max_report_len)
-        ids = ids[:T]
-        msk_t = msk_t[:T]
+        # --- TEXT ---
+        tok_np = _get_text_row(text_token_embeds, rec.text_row)        # (T, Dt)
+        msk_np = _get_text_row(text_attention_mask, rec.text_row)      # (T,)
 
-        case_ids.append(cid)
-        patch_embeds.append(pe)
-        coords_list.append(co)
-        report_ids_list.append(ids)
-        report_mask_list.append(msk_t)
+        if tok_np.ndim != 2:
+            raise ValueError(f"text token embeds must be 2D (T,Dt); got {tok_np.shape} for {rec.case_id}")
+        if msk_np.ndim != 1:
+            raise ValueError(f"text attention mask must be 1D (T,); got {msk_np.shape} for {rec.case_id}")
+        if tok_np.shape[0] != msk_np.shape[0]:
+            raise ValueError(f"text T mismatch: tok T={tok_np.shape[0]} mask T={msk_np.shape[0]} for {rec.case_id}")
+
+        T = min(tok_np.shape[0], max_report_len)
+        tok_np = tok_np[:T]
+        msk_np = safe_cast_bool_mask(msk_np[:T])
+
+        if Dt is None:
+            Dt = int(tok_np.shape[1])
+        elif int(tok_np.shape[1]) != Dt:
+            raise ValueError(f"Inconsistent Dt in batch: expected {Dt}, got {tok_np.shape[1]} for {rec.case_id}")
+
+        tok_list.append(torch.from_numpy(tok_np).float())       # (T,Dt)
+        msk_list.append(torch.from_numpy(msk_np).bool())        # (T,)
         labels_list.append(torch.from_numpy(rec.y).float())
 
-    # pad reports to max len in batch
-    max_T = max(x.shape[0] for x in report_ids_list) if report_ids_list else 0
-    max_T = min(max_T, max_report_len)
-
+    # pad text
     B = len(records)
-    report_input_ids = torch.zeros((B, max_T), dtype=torch.long)
-    report_attn_mask = torch.zeros((B, max_T), dtype=torch.bool)
+    T_max = max(t.shape[0] for t in tok_list) if tok_list else 0
+    Dt_val = int(Dt or 0)
 
+    report_tok = torch.zeros((B, T_max, Dt_val), dtype=torch.float32)
+    report_msk = torch.zeros((B, T_max), dtype=torch.bool)
     for i in range(B):
-        ids = report_ids_list[i]
-        msk = report_mask_list[i]
-        t = min(ids.shape[0], max_T)
-        report_input_ids[i, :t] = ids[:t]
-        report_attn_mask[i, :t] = msk[:t]
+        t = tok_list[i]
+        m = msk_list[i]
+        report_tok[i, : t.shape[0], :] = t
+        report_msk[i, : m.shape[0]] = m
 
-    labels = torch.stack(labels_list, dim=0)  # (B, L)
+    labels = torch.stack(labels_list, dim=0)
 
     return Batch(
         case_ids=case_ids,
         patch_embeds=patch_embeds,
         coords=coords_list,
-        report_input_ids=report_input_ids,
-        report_attn_mask=report_attn_mask,
+        report_token_embeds=report_tok,
+        report_attn_mask=report_msk,
         labels=labels,
     )
 
@@ -491,19 +576,19 @@ class SlideXL(nn.Module):
     """
 
     def __init__(
-        self,
-        d_v: int,
-        vocab_size: int,
-        d_model: int,
-        n_layers: int,
-        n_heads: int,
-        d_ff: int,
-        dropout: float,
-        sst_every_r: int,
-        sst_init_std: float,
-        max_mem_sst: int,
-        num_labels: int,
-        task_type: str,  # "binary" | "multiclass" | "multilabel"
+            self,
+            d_v: int,
+            d_t: int,          # <-- ADD THIS (text embedding dim, e.g. 768 for DistilBERT)
+            d_model: int,
+            n_layers: int,
+            n_heads: int,
+            d_ff: int,
+            dropout: float,
+            sst_every_r: int,
+            sst_init_std: float,
+            max_mem_sst: int,
+            num_labels: int,
+            task_type: str,
     ) -> None:
         super().__init__()
         if sst_every_r <= 0:
@@ -517,12 +602,8 @@ class SlideXL(nn.Module):
         self.max_mem_sst = max_mem_sst
         self.num_labels = num_labels
         self.task_type = task_type
-
+        self.text_projector = MLPProjector(d_in=d_t, d_out=d_model, dropout=dropout)
         self.projector = MLPProjector(d_in=d_v, d_out=d_model, dropout=dropout)
-
-        # A simple text embedding; replace with your own report encoder if you have embeddings already.
-        self.text_emb = nn.Embedding(vocab_size, d_model)
-
         self.layers = nn.ModuleList(
             [TransformerLayerKV(d_model=d_model, n_heads=n_heads, d_ff=d_ff, dropout=dropout) for _ in range(n_layers)]
         )
@@ -688,15 +769,15 @@ class SlideXL(nn.Module):
         return [mem], mem_mask  # keep list to match signature expansion if desired
 
     def forward(
-        self,
-        batch_patch_embeds: List[torch.Tensor],
-        batch_coords: List[Optional[torch.Tensor]],
-        report_input_ids: torch.Tensor,   # (B, T)
-        report_attn_mask: torch.Tensor,   # (B, T) bool
-        chunk_size: int,
+            self,
+            batch_patch_embeds: List[torch.Tensor],
+            batch_coords: List[Optional[torch.Tensor]],
+            report_token_embeds: torch.Tensor,  # (B,T,Dt)
+            report_attn_mask: torch.Tensor,     # (B,T) bool
+            chunk_size: int,
     ) -> torch.Tensor:
-        device = report_input_ids.device
-        B, T = report_input_ids.shape
+        device = report_token_embeds.device
+        B, T, _ = report_token_embeds.shape
 
         # Encode slide memory per case (streaming; per-sample)
         # For speed, this is per-sample loop; for production, consider batching slides by chunk length.
@@ -730,7 +811,7 @@ class SlideXL(nn.Module):
             mem_mask[i, : mm.shape[0]] = mm
 
         # Report embeddings. Converts report token IDs into vectors. # Zeroes out padding tokens (mask is boolean).
-        rep = self.text_emb(report_input_ids)  # (B,T,D)
+        rep = self.text_projector(report_token_embeds)  # (B,T,D)
         rep = rep * report_attn_mask.unsqueeze(-1).to(rep.dtype)
 
         # Late fusion cross-attention: report queries -> slide memory
@@ -817,7 +898,6 @@ class TrainConfig:
     num_labels: int
 
     d_v: int
-    vocab_size: int
     d_model: int
     n_layers: int
     n_heads: int
@@ -851,11 +931,18 @@ class TrainConfig:
     wandb_project: str
     wandb_run_name: str
 
+    text_token_embeds_npy: Path
+    text_attention_mask_npy: Path
+    d_t: int
+
+
+
 
 def parse_args() -> TrainConfig:
     p = argparse.ArgumentParser(description="Train Slide-XL (KV-summarized WSI+Report, late fusion)")
 
     # data
+    p.add_argument("--cancer_type", type=str, default="", help="If set, filter dataset to this cancer type")
     p.add_argument("--data_root", type=str, required=True)
     p.add_argument("--cases_subdir", type=str, default="cases")
     p.add_argument("--splits_subdir", type=str, default="splits")
@@ -868,7 +955,6 @@ def parse_args() -> TrainConfig:
 
     # model dims
     p.add_argument("--d_v", type=int, required=True, help="Patch embedding dimension (input)")
-    p.add_argument("--vocab_size", type=int, required=True, help="Report token vocab size")
     p.add_argument("--d_model", type=int, required=True)
     p.add_argument("--n_layers", type=int, required=True)
     p.add_argument("--n_heads", type=int, required=True)
@@ -884,6 +970,10 @@ def parse_args() -> TrainConfig:
     # streaming
     p.add_argument("--chunk_size", type=int, default=4096, help="Number of patch tokens per chunk (pre-SST)")
     p.add_argument("--max_report_len", type=int, default=512)
+
+    p.add_argument("--text_token_embeds_npy", type=str, required=True)
+    p.add_argument("--text_attention_mask_npy", type=str, required=True)
+    p.add_argument("--d_t", type=int, required=True, help="Text token embedding dim (e.g. 768)")
 
     # training
     p.add_argument("--batch_size", type=int, default=1, help="WSI streaming is heavy; start with 1")
@@ -938,7 +1028,6 @@ def parse_args() -> TrainConfig:
         task_type=args.task_type,
         num_labels=num_labels,
         d_v=args.d_v,
-        vocab_size=args.vocab_size,
         d_model=args.d_model,
         n_layers=args.n_layers,
         n_heads=args.n_heads,
@@ -964,34 +1053,46 @@ def parse_args() -> TrainConfig:
         use_wandb=args.use_wandb,
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name,
+        text_token_embeds_npy=Path(args.text_token_embeds_npy),
+        text_attention_mask_npy=Path(args.text_attention_mask_npy),
+        d_t=args.d_t,
     )
 
 
 def build_loaders(cfg: TrainConfig) -> Tuple[DataLoader, DataLoader, DataLoader]:
-    cases_dir = cfg.data_root / cfg.cases_subdir
+    text_tok = np.load(str(cfg.text_token_embeds_npy), mmap_mode="r")
+    text_msk = np.load(str(cfg.text_attention_mask_npy), mmap_mode="r")
+
+    sample = _get_text_row(text_tok, 0)
+    if sample.ndim != 2 or sample.shape[1] != cfg.d_t:
+        raise ValueError(f"--d_t mismatch: expected {cfg.d_t}, got {sample.shape}")
+
     splits_dir = cfg.data_root / cfg.splits_subdir
 
     train_ds = WSIFeatureDataset(
         csv_path=splits_dir / cfg.train_csv,
-        cases_dir=cases_dir,
         label_cols=cfg.label_cols,
         strict_files=True,
     )
     val_ds = WSIFeatureDataset(
         csv_path=splits_dir / cfg.val_csv,
-        cases_dir=cases_dir,
         label_cols=cfg.label_cols,
         strict_files=True,
     )
     test_ds = WSIFeatureDataset(
         csv_path=splits_dir / cfg.test_csv,
-        cases_dir=cases_dir,
         label_cols=cfg.label_cols,
         strict_files=True,
     )
 
-    def _collate(recs: Sequence[CaseRecord]) -> Batch:
-        return collate_fn(recs, cases_dir=cases_dir, max_report_len=cfg.max_report_len)
+    collate = partial(
+        collate_with_text,
+        max_report_len=cfg.max_report_len,
+        text_token_embeds=text_tok,
+        text_attention_mask=text_msk,
+        d_v=cfg.d_v,
+    )
+
 
     train_loader = DataLoader(
         train_ds,
@@ -999,7 +1100,7 @@ def build_loaders(cfg: TrainConfig) -> Tuple[DataLoader, DataLoader, DataLoader]
         shuffle=True,
         num_workers=cfg.num_workers,
         pin_memory=True,
-        collate_fn=_collate,
+        collate_fn=collate,
     )
     val_loader = DataLoader(
         val_ds,
@@ -1007,7 +1108,7 @@ def build_loaders(cfg: TrainConfig) -> Tuple[DataLoader, DataLoader, DataLoader]
         shuffle=False,
         num_workers=cfg.num_workers,
         pin_memory=True,
-        collate_fn=_collate,
+        collate_fn=collate,
     )
     test_loader = DataLoader(
         test_ds,
@@ -1015,7 +1116,7 @@ def build_loaders(cfg: TrainConfig) -> Tuple[DataLoader, DataLoader, DataLoader]
         shuffle=False,
         num_workers=cfg.num_workers,
         pin_memory=True,
-        collate_fn=_collate,
+        collate_fn=collate,
     )
     return train_loader, val_loader, test_loader
 
@@ -1041,17 +1142,17 @@ def evaluate(cfg: TrainConfig, model: SlideXL, loader: DataLoader, device: torch
     n_batches = 0
 
     for batch in loader:
-        report_ids = batch.report_input_ids.to(device, non_blocking=True)
+        report_tok = batch.report_token_embeds.to(device, non_blocking=True)
         report_mask = batch.report_attn_mask.to(device, non_blocking=True)
-        labels = batch.labels.to(device, non_blocking=True)
 
         logits = model(
             batch_patch_embeds=batch.patch_embeds,
             batch_coords=batch.coords,
-            report_input_ids=report_ids,
+            report_token_embeds=report_tok,
             report_attn_mask=report_mask,
             chunk_size=cfg.chunk_size,
         )
+        labels = batch.labels.to(device, non_blocking=True)
         loss = model.loss_fn(logits, labels)
         acc = accuracy_from_logits(logits, labels, cfg.task_type)
 
@@ -1079,7 +1180,7 @@ def train(cfg: TrainConfig) -> None:
 
     model = SlideXL(
         d_v=cfg.d_v,
-        vocab_size=cfg.vocab_size,
+        d_t=cfg.d_t,
         d_model=cfg.d_model,
         n_layers=cfg.n_layers,
         n_heads=cfg.n_heads,
@@ -1114,7 +1215,7 @@ def train(cfg: TrainConfig) -> None:
         opt.zero_grad(set_to_none=True)
 
         for step, batch in enumerate(train_loader, start=1):
-            report_ids = batch.report_input_ids.to(device, non_blocking=True)
+            report_tok = batch.report_token_embeds.to(device, non_blocking=True)
             report_mask = batch.report_attn_mask.to(device, non_blocking=True)
             labels = batch.labels.to(device, non_blocking=True)
 
@@ -1122,11 +1223,12 @@ def train(cfg: TrainConfig) -> None:
                 logits = model(
                     batch_patch_embeds=batch.patch_embeds,
                     batch_coords=batch.coords,
-                    report_input_ids=report_ids,
+                    report_token_embeds=report_tok,
                     report_attn_mask=report_mask,
                     chunk_size=cfg.chunk_size,
                 )
                 loss = model.loss_fn(logits, labels) / cfg.grad_accum
+
 
             scaler.scale(loss).backward()
 
